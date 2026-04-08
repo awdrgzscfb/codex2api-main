@@ -460,17 +460,44 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		return
 	}
 
+	seen := make(map[string]bool, len(tokens))
+	uniqueTokens := make([]string, 0, len(tokens))
+	duplicateCount := 0
+	for _, rt := range tokens {
+		if seen[rt] {
+			duplicateCount++
+			continue
+		}
+		seen[rt] = true
+		uniqueTokens = append(uniqueTokens, rt)
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+
+	existingRTs, err := h.db.GetAllRefreshTokens(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	newTokens := make([]string, 0, len(uniqueTokens))
+	for _, rt := range uniqueTokens {
+		if existingRTs[rt] {
+			duplicateCount++
+			continue
+		}
+		newTokens = append(newTokens, rt)
+	}
 
 	successCount := 0
 	failCount := 0
 
-	for i, rt := range tokens {
+	for i, rt := range newTokens {
 		name := req.Name
 		if name == "" {
 			name = fmt.Sprintf("account-%d", i+1)
-		} else if len(tokens) > 1 {
+		} else if len(newTokens) > 1 {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
@@ -496,7 +523,11 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		go func(accountID int64) {
 			refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
+			refreshFn := h.refreshAccount
+			if refreshFn == nil {
+				refreshFn = h.refreshSingleAccount
+			}
+			if err := refreshFn(refreshCtx, accountID); err != nil {
 				log.Printf("新账号 %d 刷新失败: %v", accountID, err)
 			} else {
 				log.Printf("新账号 %d 刷新成功，已加入号池", accountID)
@@ -505,7 +536,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	}
 
 	// 记录安全审计日志
-	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 
 	msg := fmt.Sprintf("成功添加 %d 个账号", successCount)
 	if failCount > 0 {
@@ -513,9 +544,10 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": msg,
-		"success": successCount,
-		"failed":  failCount,
+		"message":   msg,
+		"success":   successCount,
+		"duplicate": duplicateCount,
+		"failed":    failCount,
 	})
 }
 
@@ -577,17 +609,44 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		return
 	}
 
+	seen := make(map[string]bool, len(tokens))
+	uniqueTokens := make([]string, 0, len(tokens))
+	duplicateCount := 0
+	for _, at := range tokens {
+		if seen[at] {
+			duplicateCount++
+			continue
+		}
+		seen[at] = true
+		uniqueTokens = append(uniqueTokens, at)
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+
+	existingATs, err := h.db.GetAllAccessTokens(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	newTokens := make([]string, 0, len(uniqueTokens))
+	for _, at := range uniqueTokens {
+		if existingATs[at] {
+			duplicateCount++
+			continue
+		}
+		newTokens = append(newTokens, at)
+	}
 
 	successCount := 0
 	failCount := 0
 
-	for i, at := range tokens {
+	for i, at := range newTokens {
 		name := req.Name
 		if name == "" {
 			name = fmt.Sprintf("at-account-%d", i+1)
-		} else if len(tokens) > 1 {
+		} else if len(newTokens) > 1 {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
@@ -636,7 +695,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
 	}
 
-	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 
 	msg := fmt.Sprintf("成功添加 %d 个 AT 账号", successCount)
 	if failCount > 0 {
@@ -644,9 +703,10 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": msg,
-		"success": successCount,
-		"failed":  failCount,
+		"message":   msg,
+		"success":   successCount,
+		"duplicate": duplicateCount,
+		"failed":    failCount,
 	})
 }
 
