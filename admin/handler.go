@@ -34,6 +34,7 @@ type Handler struct {
 	db             *database.DB
 	rateLimiter    *proxy.RateLimiter
 	refreshAccount func(context.Context, int64) error
+	refreshToken   func(context.Context, string, string) (*auth.TokenData, *auth.AccountInfo, error)
 	cpuSampler     *cpuSampler
 	startedAt      time.Time
 	pgMaxConns     int
@@ -76,6 +77,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		chartCacheData: make(map[string]*chartCacheEntry),
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
+	handler.refreshToken = auth.RefreshWithRetry
 	return handler
 }
 
@@ -481,6 +483,13 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		return
 	}
 
+	existingRows, err := h.db.ListActive(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	identityKeys := buildExistingIdentitySet(existingRows)
+
 	newTokens := make([]string, 0, len(uniqueTokens))
 	for _, rt := range uniqueTokens {
 		if existingRTs[rt] {
@@ -494,14 +503,37 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	failCount := 0
 
 	for i, rt := range newTokens {
+		refreshFn := h.refreshToken
+		if refreshFn == nil {
+			refreshFn = auth.RefreshWithRetry
+		}
+
+		refreshCtx, refreshCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		td, info, refreshErr := refreshFn(refreshCtx, rt, req.ProxyURL)
+		refreshCancel()
+		if refreshErr != nil {
+			log.Printf("鎵嬪姩娣诲姞璐﹀彿 %d 鍒锋柊澶辫触: %v", i+1, refreshErr)
+			failCount++
+			continue
+		}
+
+		if info != nil && hasIdentityConflict(identityKeys, info.Email, info.ChatGPTAccountID) {
+			duplicateCount++
+			continue
+		}
+
 		name := req.Name
 		if name == "" {
-			name = fmt.Sprintf("account-%d", i+1)
+			if info != nil && strings.TrimSpace(info.Email) != "" {
+				name = strings.TrimSpace(info.Email)
+			} else {
+				name = fmt.Sprintf("account-%d", i+1)
+			}
 		} else if len(newTokens) > 1 {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
-		id, err := h.db.InsertAccount(ctx, name, rt, req.ProxyURL)
+		id, err := h.db.InsertAccount(ctx, name, td.RefreshToken, req.ProxyURL)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
@@ -511,11 +543,34 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual")
 
+		creds := map[string]interface{}{
+			"refresh_token": td.RefreshToken,
+			"access_token":  td.AccessToken,
+			"id_token":      td.IDToken,
+			"expires_at":    td.ExpiresAt.Format(time.RFC3339),
+		}
+		if info != nil {
+			creds["email"] = info.Email
+			creds["account_id"] = info.ChatGPTAccountID
+			creds["plan_type"] = info.PlanType
+		}
+		if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
+			log.Printf("鎵嬪姩娣诲姞璐﹀彿 %d 鏇存柊 credentials 澶辫触: %v", id, err)
+		}
+
 		// 热加载：直接加入内存池
 		newAcc := &auth.Account{
 			DBID:         id,
-			RefreshToken: rt,
+			RefreshToken: td.RefreshToken,
+			AccessToken:  td.AccessToken,
+			ExpiresAt:    td.ExpiresAt,
 			ProxyURL:     req.ProxyURL,
+		}
+		if info != nil {
+			newAcc.Email = info.Email
+			newAcc.AccountID = info.ChatGPTAccountID
+			newAcc.PlanType = info.PlanType
+			appendIdentityKeys(identityKeys, info.Email, info.ChatGPTAccountID)
 		}
 		h.store.AddAccount(newAcc)
 
@@ -539,6 +594,9 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 
 	msg := fmt.Sprintf("成功添加 %d 个账号", successCount)
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，跳过 %d 个重复账号", duplicateCount)
+	}
 	if failCount > 0 {
 		msg += fmt.Sprintf("，%d 个失败", failCount)
 	}
@@ -630,6 +688,13 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		return
 	}
 
+	existingRows, err := h.db.ListActive(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	identityKeys := buildExistingIdentitySet(existingRows)
+
 	newTokens := make([]string, 0, len(uniqueTokens))
 	for _, at := range uniqueTokens {
 		if existingATs[at] {
@@ -643,9 +708,19 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 	failCount := 0
 
 	for i, at := range newTokens {
+		atInfo := auth.ParseAccessToken(at)
+		if atInfo != nil && hasIdentityConflict(identityKeys, atInfo.Email, atInfo.ChatGPTAccountID) {
+			duplicateCount++
+			continue
+		}
+
 		name := req.Name
 		if name == "" {
-			name = fmt.Sprintf("at-account-%d", i+1)
+			if atInfo != nil && strings.TrimSpace(atInfo.Email) != "" {
+				name = strings.TrimSpace(atInfo.Email)
+			} else {
+				name = fmt.Sprintf("at-account-%d", i+1)
+			}
 		} else if len(newTokens) > 1 {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
@@ -659,9 +734,6 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
-
-		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
-		atInfo := auth.ParseAccessToken(at)
 
 		// 热加载到内存池（AT-only，无 RT）
 		newAcc := &auth.Account{
@@ -677,6 +749,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			if !atInfo.ExpiresAt.IsZero() {
 				newAcc.ExpiresAt = atInfo.ExpiresAt
 			}
+			appendIdentityKeys(identityKeys, atInfo.Email, atInfo.ChatGPTAccountID)
 		}
 		h.store.AddAccount(newAcc)
 
@@ -698,6 +771,9 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 
 	msg := fmt.Sprintf("成功添加 %d 个 AT 账号", successCount)
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，跳过 %d 个重复账号", duplicateCount)
+	}
 	if failCount > 0 {
 		msg += fmt.Sprintf("，%d 个失败", failCount)
 	}
@@ -743,6 +819,42 @@ var utf8BOM = []byte{0xef, 0xbb, 0xbf}
 
 func trimUTF8BOM(data []byte) []byte {
 	return bytes.TrimPrefix(data, utf8BOM)
+}
+
+func normalizeIdentityValue(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func appendIdentityKeys(keys map[string]bool, email string, accountID string) {
+	if normalizedEmail := normalizeIdentityValue(email); normalizedEmail != "" {
+		keys["email:"+normalizedEmail] = true
+	}
+	if normalizedAccountID := normalizeIdentityValue(accountID); normalizedAccountID != "" {
+		keys["account_id:"+normalizedAccountID] = true
+	}
+}
+
+func hasIdentityConflict(keys map[string]bool, email string, accountID string) bool {
+	normalizedEmail := normalizeIdentityValue(email)
+	if normalizedEmail != "" && keys["email:"+normalizedEmail] {
+		return true
+	}
+	normalizedAccountID := normalizeIdentityValue(accountID)
+	if normalizedAccountID != "" && keys["account_id:"+normalizedAccountID] {
+		return true
+	}
+	return false
+}
+
+func buildExistingIdentitySet(rows []*database.AccountRow) map[string]bool {
+	keys := make(map[string]bool)
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		appendIdentityKeys(keys, row.GetCredential("email"), row.GetCredential("account_id"))
+	}
+	return keys
 }
 
 // parseImportJSONTokens 同时兼容现有扁平 JSON 和 Sub2Api 顶层对象。

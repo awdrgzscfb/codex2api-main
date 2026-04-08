@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest, AddATAccountRequest } from '../types'
+import type { AccountRow, AddAccountRequest, AddATAccountRequest, CreateAccountResponse } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -82,6 +82,11 @@ export default function Accounts() {
   const folderInputRef = useRef<HTMLInputElement>(null)
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
+
+  const getAddAccountToastMessage = useCallback((result: CreateAccountResponse) => {
+    const message = result.message?.trim()
+    return message || t('accounts.addSuccess')
+  }, [t])
 
   const loadAccounts = useCallback(async () => {
     const data = await api.getAccounts()
@@ -196,8 +201,8 @@ export default function Accounts() {
     if (!addForm.refresh_token.trim()) return
     setSubmitting(true)
     try {
-      await api.addAccount(addForm)
-      showToast(t('accounts.addSuccess'))
+      const result = await api.addAccount(addForm)
+      showToast(getAddAccountToastMessage(result))
       setShowAdd(false)
       setAddForm({ refresh_token: '', proxy_url: '' })
       void reload()
@@ -212,8 +217,8 @@ export default function Accounts() {
     if (!atForm.access_token.trim()) return
     setSubmitting(true)
     try {
-      await api.addATAccount(atForm)
-      showToast(t('accounts.addSuccess'))
+      const result = await api.addATAccount(atForm)
+      showToast(getAddAccountToastMessage(result))
       setShowAdd(false)
       setAtForm({ access_token: '', proxy_url: '' })
       void reload()

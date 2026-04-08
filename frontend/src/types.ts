@@ -90,7 +90,9 @@ export interface MessageResponse {
 }
 
 export interface CreateAccountResponse extends MessageResponse {
-  id: number
+  success?: number
+  duplicate?: number
+  failed?: number
 }
 
 export interface AdminErrorResponse {
