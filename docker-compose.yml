@@ -2,7 +2,7 @@ name: codex2api
 
 services:
   codex2api:
-    image: ghcr.io/awdrgzscfb/codex2api-main:latest
+    build: .
     container_name: codex2api
     ports:
       - "${CODEX_PORT:-8090}:${CODEX_PORT:-8090}"
